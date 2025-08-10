@@ -14,7 +14,7 @@
  * - You’ll see status + a Refresh button
  */
 
-module.exports.svcstatus = function (parent) {
+module.exports.odcmini = function (parent) {
   const obj = {};
   obj.parent = parent;            // plugin handler
   obj.meshServer = parent.parent; // MeshCentral server
