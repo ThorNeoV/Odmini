@@ -1,157 +1,166 @@
 "use strict";
 
 /**
- * ODCMini – Service column only (safe & minimal)
- * - Adds ONE column in the devices list that shows OneDriveCheckService status.
- * - Uses agent RunCommands (bat) to run: sc query "OneDriveCheckService".
- * - No DB writes, no iframes, no external scripts, peering ignored.
+ * svcstatus – Device Plugins tab: show OneDriveCheckService status
  *
- * Endpoints (while logged in):
- *   /pluginadmin.ashx?pin=odcmini&health=1
- *   /pluginadmin.ashx?pin=odcmini&status=1&id=<shortOrLong>[&id=...]
- *   /pluginadmin.ashx?pin=odcmini&include=1&path=col.js   ← small UI injector
+ * SAFE:
+ * - No UI injection into global pages
+ * - No DB writes
+ * - No Express hooks
+ * - Uses only: onDeviceRefreshEnd + pluginadmin bridge + runcommands (reply:true)
+ *
+ * How it shows up:
+ * - Open a device → Plugins tab → "Service: OneDriveCheck"
+ * - You’ll see status + a Refresh button
  */
 
-module.exports.odcmini = function (parent) {
+module.exports.svcstatus = function (parent) {
   const obj = {};
-  obj.parent = parent;
-  obj.meshServer = parent.parent;
+  obj.parent = parent;            // plugin handler
+  obj.meshServer = parent.parent; // MeshCentral server
   const wsserver = obj.meshServer.webserver;
 
-  // Only what we need
-  obj.exports = ["handleAdminReq", "hook_processAgentData", "onWebUIStartupEnd"];
+  // Exported hooks (keep it minimal)
+  obj.exports = [ "onDeviceRefreshEnd", "handleAdminReq", "hook_processAgentData" ];
 
+  // ---- config: service name (hardcoded per your request)
   const SERVICE_NAME = "OneDriveCheckService";
-  const log = (m)=>{ try{ obj.meshServer.info("odcmini: "+m); }catch{ console.log("odcmini:",m); } };
-  const err = (e)=>{ try{ obj.meshServer.debug("odcmini error: "+(e && e.stack || e)); }catch{ console.error("odcmini error:",e); } };
 
-  // -------- agent map helpers
-  function wsAgents() { return (wsserver && wsserver.wsagents) || {}; }
+  // ---- small logger helpers
+  const log = (m)=>{ try{ obj.meshServer.info("svcstatus: " + m); }catch{ console.log("svcstatus:", m); } };
+  const err = (e)=>{ try{ obj.meshServer.debug("svcstatus error: " + (e && e.stack || e)); }catch{ console.error("svcstatus error:", e); } };
 
-  // Accept short or long id; resolve to exact wsagents key (local server only)
-  function resolveNodeId(input) {
-    if (!input) return null;
-    const a = wsAgents();
-    const want = String(input).trim();
-    const long = want.startsWith('node//') ? want : ('node//' + want);
-    if (a[long]) return long;
-    const short = want.startsWith('node//') ? want.substring(6) : want;
-    const keys = Object.keys(a);
-    let hit = keys.find(k => k.substring(6) === short);
-    if (hit) return hit;
-    hit = keys.find(k => k.includes(short));
-    return hit || null;
-  }
-
-  // -------- replies (responseid -> resolver)
+  // ---- reply tracking
   const pend = new Map();
-  const mkRid = ()=> 'odc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  function makeResponseId(){ return 'svc_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
+  // Handle agent replies
   obj.hook_processAgentData = function(agent, command) {
     try {
       if (!command) return;
       if (command.action === 'runcommands' && command.responseid) {
         const p = pend.get(command.responseid);
-        if (!p) return;
-        pend.delete(command.responseid);
-        clearTimeout(p.timeout);
-        const raw = (command.console || command.result || '').toString();
-        p.resolve({ ok:true, raw });
+        if (p) {
+          pend.delete(command.responseid);
+          clearTimeout(p.timeout);
+          const raw = (command.console || command.result || '').toString();
+          p.resolve({ ok:true, raw });
+        }
       }
     } catch (e) { err(e); }
   };
 
-  // -------- run a BAT line and wait
-  function runBatAndWait(nodeId, batLine){
-    return new Promise((resolve)=>{
-      const agentKey = resolveNodeId(nodeId);
-      if (!agentKey) { resolve({ ok:false, raw:'', meta:'agent_not_found' }); return; }
-      const agent = wsAgents()[agentKey];
-      if (!agent) { resolve({ ok:false, raw:'', meta:'offline' }); return; }
-
-      const responseid = mkRid();
-      const payload = {
+  // Send runcommands to an agent and await reply (local or peer not required; you said direct)
+  function runCommandsAndWait(nodeId, type, lines){
+    return new Promise((resolve) => {
+      const responseid = makeResponseId();
+      const theCommand = {
         action: 'runcommands',
-        type: 'bat',
-        cmds: [ String(batLine||'') ],
-        runAsUser: false,
+        type,                     // 'bat' or 'ps'
+        cmds: Array.isArray(lines) ? lines : [ String(lines||'') ],
+        runAsUser: false,         // run as agent
         reply: true,
         responseid
       };
 
-      const timeout = setTimeout(()=>{
+      // timeout
+      const timeout = setTimeout(() => {
         if (pend.has(responseid)) pend.delete(responseid);
         resolve({ ok:false, raw:'', meta:'timeout' });
       }, 15000);
 
       pend.set(responseid, { resolve, timeout });
 
-      try { agent.send(JSON.stringify(payload)); }
-      catch (ex) { err(ex); resolve({ ok:false, raw:'', meta:'send_fail' }); }
+      const agent = wsserver && wsserver.wsagents ? wsserver.wsagents[nodeId] : null;
+      if (agent && agent.authenticated === 2) {
+        try { agent.send(JSON.stringify(theCommand)); }
+        catch (ex) { err(ex); resolve({ ok:false, raw:'', meta:'send_fail' }); }
+      } else {
+        resolve({ ok:false, raw:'', meta:'offline' });
+      }
     });
   }
 
-  // -------- build + parse service probe
-  function buildServiceProbe(){
-    // Will echo exactly one of: svc=Running | svc=NotRunning | svc=NotFound
-    return 'sc query "' + SERVICE_NAME + '" | findstr /I RUNNING >nul && echo svc=Running || (sc query "' + SERVICE_NAME + '" | findstr /I STATE >nul && echo svc=NotRunning || echo svc=NotFound)';
-  }
-  function parseService(raw){
-    const m = /svc\s*=\s*(Running|NotRunning|NotFound)/i.exec(String(raw||''));
-    return m ? m[1] : 'Unknown';
-  }
-
-  // -------- simple 30s cache (id -> {ts, service})
-  const cache = new Map();
-  function getCached(id){
-    const c = cache.get(id);
-    if (!c) return null;
-    if ((Date.now() - c.ts) > 30000) { cache.delete(id); return null; }
-    return c.service;
-  }
-  function putCache(id, service){
-    cache.set(id, { ts: Date.now(), service });
+  // Parse Windows SC output → Running / NotRunning / NotFound
+  function parseSvc(raw){
+    const s = String(raw||'');
+    if (/RUNNING/i.test(s)) return 'Running';
+    if (/does not exist|OpenService FAILED|SERVICE_NAME:.*\bFAILED\b/i.test(s)) return 'NotFound';
+    // If it mentions STOPPED or we didn’t match RUNNING, call it NotRunning
+    if (/STOPPED|STATE\s*:\s*\d+\s+STOPPED/i.test(s)) return 'NotRunning';
+    return 'NotRunning';
   }
 
-  // -------- admin bridge endpoints
+  // Query service status on Windows (fast BAT)
+  async function svcStatusWin(nodeId){
+    const line = `sc query "${SERVICE_NAME}" | findstr /I RUNNING >nul && echo svc=Running || echo svc=NotRunning`;
+    const res = await runCommandsAndWait(nodeId, 'bat', line);
+    if (!res.ok) return { ok:false, status:'Offline', raw:res.raw||'', meta:res.meta };
+    const m = /svc\s*=\s*(Running|NotRunning)/i.exec(res.raw||'');
+    const status = m ? (m[1]==='Running'?'Running':'NotRunning') : parseSvc(res.raw);
+    return { ok:true, status, raw:res.raw||'' };
+  }
+
+  // ---- admin bridge endpoints (used only by our device-tab iframe)
   obj.handleAdminReq = async function(req, res, user) {
     try {
       if (!user) { res.status(401).end('Unauthorized'); return; }
 
-      if (req.query.health == 1) { res.json({ ok:true, plugin:'odcmini', exports:obj.exports }); return; }
+      // Health
+      if (req.query.health == 1) { res.json({ ok:true, plugin:'svcstatus', exports:obj.exports }); return; }
 
-      // Serve the tiny UI injector
-      if (req.query.include == 1) {
-        const file = String(req.query.path||'').replace(/\\/g,'/').trim();
-        if (file !== 'col.js') { res.sendStatus(404); return; }
-        res.setHeader('Content-Type','application/javascript; charset=utf-8');
-        res.end(buildClientJS());
+      // UI panel (iframe)
+      if (req.query.panel == 1) {
+        const nodeid = String(req.query.nodeid||'');
+        res.setHeader('Content-Type','text/html; charset=utf-8');
+        res.end(`<!doctype html><meta charset="utf-8">
+<title>Service: OneDriveCheck</title>
+<link rel="stylesheet" href="/public/semantic/semantic.min.css">
+<div style="padding:14px">
+  <h3 class="ui header">
+    <i class="cog icon"></i>
+    <div class="content">Service: OneDriveCheck <div class="sub header">${SERVICE_NAME}</div></div>
+  </h3>
+  <div id="out" class="ui segment">Checking…</div>
+  <button class="ui button" id="refresh">Refresh</button>
+</div>
+<script>
+  (function(){
+    const nodeid = ${JSON.stringify(nodeid)};
+    const out = document.getElementById('out');
+    const btn = document.getElementById('refresh');
+    async function check(){
+      out.textContent = 'Checking…';
+      try{
+        const r = await fetch('/pluginadmin.ashx?pin=svcstatus&status=1&id=' + encodeURIComponent(nodeid), { credentials:'same-origin' });
+        const j = await r.json();
+        const s = j && j.status ? j.status : 'Unknown';
+        const raw = j && j.raw ? j.raw : '';
+        out.innerHTML = '<b>Status:</b> ' + s + (raw ? '<pre style="margin-top:8px;white-space:pre-wrap">'+String(raw).replace(/[&<>]/g, c=>({\"&\":\"&amp;\",\"<\":\"&lt;\",\">\":\"&gt;\"}[c]))+'</pre>':'');
+      }catch(e){ out.textContent = 'Error'; }
+    }
+    btn.addEventListener('click', check);
+    check();
+  })();
+</script>`);
         return;
       }
 
+      // Status (Windows only)
       if (req.query.status == 1) {
-        let ids = req.query.id;
-        if (!ids) { res.json({}); return; }
-        if (!Array.isArray(ids)) ids = [ids];
+        const id = String(req.query.id||'').trim();
+        const nodeId = id.startsWith('node//') ? id : ('node//' + id);
+        const agent = wsserver && wsserver.wsagents ? wsserver.wsagents[nodeId] : null;
+        if (!agent) { res.json({ id:nodeId, ok:false, status:'Offline', raw:'' }); return; }
 
-        const result = {};
-        // process sequentially to avoid blasting the agent
-        for (const original of ids) {
-          const id = resolveNodeId(original) || (original.startsWith('node//')?original:('node//'+original));
-          const cached = getCached(id);
-          if (cached) { result[id] = { service: cached, ok:true }; continue; }
+        // OS detection (very light)
+        const isWin = (agent.agentInfo && agent.agentInfo.platform && /win/i.test(agent.agentInfo.platform)) ||
+                      (agent.dbNode && /Windows/i.test(agent.dbNode.osdesc||'')) || true; // default to Windows for your fleet
 
-          // If agent unknown locally → Offline
-          if (!resolveNodeId(original)) { result[id] = { service:'Offline', ok:false }; continue; }
+        if (!isWin) { res.json({ id:nodeId, ok:false, status:'NotSupported', raw:'' }); return; }
 
-          const bat = buildServiceProbe();
-          const r = await runBatAndWait(id, bat);
-          if (!r.ok) { result[id] = { service:'Offline', ok:false }; continue; }
-          const svc = parseService(r.raw);
-          putCache(id, svc);
-          result[id] = { service: svc, ok:true };
-        }
-        res.json(result);
+        const r = await svcStatusWin(nodeId);
+        res.json({ id:nodeId, ok:r.ok, status:r.status, raw:r.raw||'' });
         return;
       }
 
@@ -159,84 +168,23 @@ module.exports.odcmini = function (parent) {
     } catch (e) { err(e); res.sendStatus(500); }
   };
 
-  // -------- inject one small script into the Mesh UI
-  obj.onWebUIStartupEnd = function () {
-    const v = (Date.now() % 1e6);
-    return `<script src="/pluginadmin.ashx?pin=odcmini&include=1&path=col.js&v=${v}"></script>`;
+  // ---- Web UI hook: add a Plugins tab on the device page
+  obj.onDeviceRefreshEnd = function() {
+    // This runs in the browser context (Mesh UI). Use the standard pattern to add a plugin tab.
+    // Keep it VERY small and safe.
+    pluginHandler.registerPluginTab({ tabId: 'svcstatus', tabTitle: 'Service: OneDriveCheck' });
+    // Render an iframe pointing to our admin bridge with the node id.
+    // QA() helper exists in Mesh UI to put HTML into the tab div.
+    try {
+      // 'currentNode' is available in this context for the selected device.
+      var nid = (typeof currentNodeId === 'function') ? currentNodeId() : (typeof currentNode === 'object' && currentNode && currentNode._id ? currentNode._id : null);
+      if (!nid) { QA('svcstatus', '<div style="padding:12px">Select a device to view.</div>'); return; }
+      QA('svcstatus', '<iframe style="width:100%;height:420px;border:0" src="/pluginadmin.ashx?pin=svcstatus&panel=1&nodeid=' + encodeURIComponent(nid) + '"></iframe>');
+    } catch (e) {
+      // If anything goes wrong, fail silently—no white screens.
+    }
   };
 
-  // -------- client-side JS (adds one column & polls our status endpoint)
-  function buildClientJS(){
-    return `(()=>{"use strict";
-  const COL_ID = "col_odcmini_service";
-  const TITLE = "OneDriveCheckService";
-
-  function table(){
-    return document.querySelector('#devices')
-        || document.querySelector('#devicesTable')
-        || document.querySelector('table#devicetable')
-        || document.querySelector('table[data-list="devices"]')
-        || null;
-  }
-  function rowId(row){
-    return row.getAttribute('deviceid') || row.dataset.deviceid ||
-           row.getAttribute('nodeid')   || row.dataset.nodeid   ||
-           (row.id && row.id.startsWith('d_') ? row.id.substring(2) : null) || null;
-  }
-  function addHeader(){
-    const g=table(); if(!g) return false;
-    const thead=g.querySelector('thead'); if(!thead) return false;
-    const tr=thead.querySelector('tr'); if(!tr) return false;
-    if(!document.getElementById(COL_ID)){
-      const th=document.createElement('th'); th.id=COL_ID; th.textContent=TITLE; th.style.whiteSpace='nowrap';
-      tr.appendChild(th);
-    }
-    return true;
-  }
-  function ensureCells(){
-    const g=table(); if(!g) return [];
-    const tbody=g.querySelector('tbody'); if(!tbody) return [];
-    const ids=[];
-    tbody.querySelectorAll('tr').forEach(r=>{
-      if(!r.querySelector('.odcmini-cell')){
-        const td=document.createElement('td'); td.className='odcmini-cell'; td.textContent='—'; td.style.whiteSpace='nowrap';
-        r.appendChild(td);
-      }
-      const id=rowId(r); if(id) ids.push(id);
-    });
-    return ids;
-  }
-  function paint(map){
-    const g=table(); if(!g) return;
-    g.querySelectorAll('tbody tr').forEach(r=>{
-      const id=rowId(r); const td=r.querySelector('.odcmini-cell'); if(!td) return;
-      const info = id && map && map['node//'+id];
-      const svc = info && info.service;
-      if(!svc){ td.textContent='—'; td.style.color=''; td.style.fontWeight=''; return; }
-      td.textContent = svc;
-      td.style.fontWeight='600';
-      td.style.color = (svc==='Running'?'#0a0':(svc==='NotRunning'?'#c60':(svc==='Offline'?'#c00':'#555')));
-      td.title = TITLE;
-    });
-  }
-  function fetchStatus(shortIds){
-    const qs = shortIds.map(id=>'&id='+encodeURIComponent(id)).join('');
-    return fetch('/pluginadmin.ashx?pin=odcmini&status=1'+qs, { credentials:'same-origin' })
-      .then(r=>r.json()).catch(()=>({}));
-  }
-  function tick(){
-    if(!addHeader()) return;
-    const ids=ensureCells(); if(ids.length===0) return;
-    fetchStatus(ids).then(paint);
-  }
-
-  document.addEventListener('meshcentralDeviceListRefreshEnd', ()=> setTimeout(tick, 200));
-  window.addEventListener('hashchange', ()=> setTimeout(tick, 200));
-  setInterval(tick, 10000);
-  setTimeout(tick, 600);
-})();`;
-  }
-
-  log("service column loaded");
+  log("loaded");
   return obj;
 };
