@@ -1,10 +1,10 @@
 {
   "name": "ODC Mini",
   "shortName": "odcmini",
-  "version": "0.0.17",
+  "version": "0.0.18",
   "author": "you",
   "description": "Tiny plugin with a single health endpoint. No UI injection.",
-  "hasAdminPanel": true,
+  "hasAdminPanel": false,
   "homepage": "https://github.com/ThorNeoV/Odmini",
   "changelogUrl": "https://raw.githubusercontent.com/ThorNeoV/Odmini/refs/heads/main/README.md",
   "configUrl": "https://raw.githubusercontent.com/ThorNeoV/Odmini/refs/heads/main/config.json",
