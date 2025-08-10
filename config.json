@@ -1,0 +1,14 @@
+{
+  "name": "ODC Mini",
+  "shortName": "odcmini",
+  "version": "0.0.1",
+  "author": "you",
+  "description": "Tiny plugin with a single health endpoint. No UI injection.",
+  "hasAdminPanel": false,
+  "homepage": "https://example.invalid",
+  "changelogUrl": "https://example.invalid",
+  "configUrl": "https://example.invalid",
+  "downloadUrl": "https://example.invalid",
+  "repository": { "type": "git", "url": "https://example.invalid" },
+  "meshCentralCompat": ">=1.0.0"
+}
