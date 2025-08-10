@@ -1,12 +1,5 @@
 "use strict";
 
-/**
- * odcmini — SAFE port check for 20707/20773
- * - No UI injection, no DB writes, no peering, no columns/tabs.
- * - Use while logged in:
- *     /pluginadmin.ashx?pin=odcmini&health=1
- *     /pluginadmin.ashx?pin=odcmini&check=1&id=<shortOrLongNodeId>
- */
 module.exports.odcmini = function (parent) {
   const obj = {};
   obj.parent = parent;
@@ -19,9 +12,33 @@ module.exports.odcmini = function (parent) {
   const pend = new Map();
   const log = (m)=>{ try{ obj.meshServer.info("odcmini: " + m); }catch{ console.log("odcmini:", m); } };
   const err = (e)=>{ try{ obj.meshServer.debug("odcmini error: " + (e && e.stack || e)); }catch{ console.error("odcmini error:", e); } };
-  const norm = (id)=> (!id ? id : (/^node\/\/.+/i.test(id) ? id : ('node//' + id)));
 
   function rid(){ return 'odc_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+  // ---- ID resolver: map short or long to live agent key
+  function resolveAgentKey(inputId){
+    if (!wsserver || !wsserver.wsagents) return null;
+    if (!inputId) return null;
+    const wantShort = inputId.replace(/^node\/\//i,'').trim();
+    const wantLong  = inputId.startsWith('node//') ? inputId : ('node//' + wantShort);
+
+    const agents = wsserver.wsagents;
+    // Fast paths
+    if (agents[wantLong]) return wantLong;
+    if (agents[inputId])  return inputId;
+
+    // Scan and try to match dbNode._id or key suffix
+    for (const k of Object.keys(agents)) {
+      try {
+        if (k === wantLong || k === inputId) return k;
+        const a = agents[k];
+        const dn = a.dbNode || a.dbNodeKey || {};
+        if (dn && (dn._id === wantLong || dn._id === inputId)) return k;
+        if (k.endsWith(wantShort)) return k; // helpful when domain/hash is appended
+      } catch {}
+    }
+    return null;
+  }
 
   obj.hook_processAgentData = function(agent, cmd){
     try{
@@ -38,13 +55,13 @@ module.exports.odcmini = function (parent) {
     }catch(e){ err(e); }
   };
 
-  function runBat(nodeId, line){
+  function runBat(agentKey, line){
     return new Promise((res)=>{
       const responseid = rid();
       const msg = { action:'runcommands', type:'bat', cmds:[line], runAsUser:false, reply:true, responseid };
       const t = setTimeout(()=>{ pend.delete(responseid); res({ ok:false, raw:'', meta:'timeout' }); }, 12000);
       pend.set(responseid, { res, t });
-      const agent = wsserver && wsserver.wsagents ? wsserver.wsagents[nodeId] : null;
+      const agent = wsserver && wsserver.wsagents ? wsserver.wsagents[agentKey] : null;
       if (agent && agent.authenticated === 2) {
         try { agent.send(JSON.stringify(msg)); } catch(ex){ err(ex); clearTimeout(t); pend.delete(responseid); res({ ok:false, raw:'', meta:'send_fail' }); }
       } else {
@@ -53,13 +70,9 @@ module.exports.odcmini = function (parent) {
     });
   }
 
-  // Fast Windows netstat check: echo p20707=True/False & p20773=True/False
-  async function checkWin(nodeId){
-    const bat = [
-      `(netstat -an | findstr /C::${PORTS[0]} >nul && echo p${PORTS[0]}=True || echo p${PORTS[0]}=False)`,
-      `& (netstat -an | findstr /C::${PORTS[1]} >nul && echo p${PORTS[1]}=True || echo p${PORTS[1]}=False)`
-    ].join(' ');
-    const r = await runBat(nodeId, bat);
+  async function checkWin(agentKey){
+    const bat = `(netstat -an | findstr /C::${PORTS[0]} >nul && echo p${PORTS[0]}=True || echo p${PORTS[0]}=False) & (netstat -an | findstr /C::${PORTS[1]} >nul && echo p${PORTS[1]}=True || echo p${PORTS[1]}=False)`;
+    const r = await runBat(agentKey, bat);
     if (!r.ok) return { ok:false, data:null, raw:r.raw||'', meta:r.meta||'fail' };
     const out = String(r.raw||'');
     const mA = new RegExp(`p${PORTS[0]}\\s*=\\s*(True|False)`, 'i').exec(out);
@@ -76,15 +89,20 @@ module.exports.odcmini = function (parent) {
       if (req.query.health == 1) { res.json({ ok:true, plugin:'odcmini', exports:obj.exports, hasUser:!!user }); return; }
 
       if (req.query.check == 1) {
-        const id = norm(String(req.query.id||'').trim());
-        if (!id) { res.json({ ok:false, error:'missing id' }); return; }
-        const agent = wsserver && wsserver.wsagents ? wsserver.wsagents[id] : null;
-        if (!agent) { res.json({ id, ok:false, error:'offline' }); return; }
+        const rawId = String(req.query.id||'').trim();
+        const agentKey = resolveAgentKey(rawId);
+        if (!agentKey) { res.json({ id:rawId, ok:false, error:'offline_or_not_found' }); return; }
 
-        // Treat as Windows fleet per your environment
-        const r = await checkWin(id);
-        if (!r.ok) { res.json({ id, ok:false, error:r.meta||'failed', raw:r.raw||'' }); return; }
-        res.json({ id, ok:true, ports:r.data, raw:r.raw||'' });
+        const r = await checkWin(agentKey);
+        if (!r.ok) { res.json({ id:agentKey, ok:false, error:r.meta||'failed', raw:r.raw||'' }); return; }
+        res.json({ id:agentKey, ok:true, ports:r.data, raw:r.raw||'' });
+        return;
+      }
+
+      // Optional: debug which agents the server sees
+      if (req.query.list == 1) {
+        const keys = Object.keys((wsserver && wsserver.wsagents) || {});
+        res.json({ ok:true, count: keys.length, agents: keys });
         return;
       }
 
