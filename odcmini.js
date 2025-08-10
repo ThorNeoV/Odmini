@@ -1,76 +1,89 @@
 "use strict";
 
 /**
- * ODC Mini – admin-bridge only, no UI injection.
- * Endpoints (when logged in):
- *   /pluginadmin.ashx?pin=odcmini&health=1
- *   /pluginadmin.ashx?pin=odcmini&listonline=1       ← local server only (peering note)
- *   /pluginadmin.ashx?pin=odcmini&svc=1&id=<id>      ← check OneDriveCheckService + ports (Windows)
+ * odcmini – minimal, admin-bridge only plugin
+ * - No UI injection, no Express, no DB.
+ * - Uses RunCommands with reply:true and hook_processAgentData to collect output.
  *
- * Uses RunCommands with reply:true and resolves via hook_processAgentData.
- * Works whether the agent is connected to this server or a peer (Mesh ≥ 1.1.40).
+ * Endpoints (logged-in):
+ *   &health=1
+ *   &whoami=1
+ *   &listlocal=1
+ *   &where=1&id=<id>
+ *   &echotest=1&id=<id>
+ *   &svc=1&id=<id>
  */
 
 module.exports.odcmini = function (parent) {
   const obj = {};
-  obj.parent = parent;
-  obj.meshServer = parent.parent;
+  obj.parent = parent;                 // plugin handler
+  obj.meshServer = parent.parent;      // MeshCentral server
   const wsserver = obj.meshServer && obj.meshServer.webserver;
 
-  // Only the hooks we actually use
+  // expose only what we need (no UI hooks)
   obj.exports = ["handleAdminReq", "hook_processAgentData"];
 
   // ---- config
   const SERVICE_NAME = "OneDriveCheckService";
+  const PORT1 = 20707;
+  const PORT2 = 20773;
 
-  // ---- logging (quiet, won’t crash if methods not present)
-  const log = (m)=>{ try{ obj.meshServer.info("odcmini: " + m); }catch{} };
-  const dbg = (m)=>{ try{ obj.meshServer.debug("odcmini: " + m); }catch{} };
+  // ---- logging helpers
+  const log = (m)=>{ try{ obj.meshServer.info("odcmini: " + m); }catch{ console.log("odcmini:", m); } };
+  const err = (e)=>{ try{ obj.meshServer.debug("odcmini error: " + (e && e.stack || e)); }catch{ console.error("odcmini error:", e); } };
 
-  // ---- helpers
-  const parseBool = (v)=> /^true$/i.test(String(v).trim());
-  const normalizeId = (id)=> (!id ? id : (/^node\/\/.+/i.test(id) ? id : ('node//' + id)));
-  function isAgentOnline(nodeId){ try { return !!(wsserver && wsserver.wsagents && wsserver.wsagents[nodeId]); } catch { return false; } }
-  function listOnline() {
+  // ---- small helpers
+  const summarizeUser = (u)=> u ? ({ name:u.name, userid:u.userid, domain:u.domain, siteadmin:u.siteadmin }) : null;
+  const parseBool      = (v)=> /^true$/i.test(String(v).trim());
+  const normalizeId    = (id)=> (!id ? id : (/^node\/\/.+/i.test(id) ? id : ('node//' + id)));
+  const isLocalAgent   = (nodeId)=> !!(wsserver && wsserver.wsagents && wsserver.wsagents[nodeId]);
+
+  function listLocalAgents(){
     const a = (wsserver && wsserver.wsagents) || {};
     const out = {};
-    for (const k of Object.keys(a)) {
+    for (const key of Object.keys(a)) {
       try {
-        const n = a[k].dbNode || a[k].dbNodeKey || null;
-        out[k] = { key:k, name:(n && (n.name||n.computername))||null, os:(n && (n.osdesc||n.agentcaps))||null };
-      } catch { out[k] = { key:k }; }
+        const n = a[key].dbNode || a[key].dbNodeKey || null;
+        out[key] = {
+          key,
+          name: (n && (n.name || n.computername)) || null,
+          os:   (n && (n.osdesc || n.agentcaps)) || null
+        };
+      } catch { out[key] = { key }; }
     }
     return out;
   }
 
-  // ---- reply tracker
-  const pend = new Map(); // responseid -> { resolve, timeout }
+  // ============== Reply handling ==============
+  // responseid -> { resolve, timeout }
+  const pend = new Map();
   const makeResponseId = ()=> 'odc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
 
-  // Receive runcommands replies
   obj.hook_processAgentData = function(agent, command) {
     try {
       if (!command) return;
+      // Native runcommands reply
       if (command.action === 'runcommands' && command.responseid) {
         const p = pend.get(command.responseid);
-        if (!p) return;
-        pend.delete(command.responseid);
-        clearTimeout(p.timeout);
-        const raw = (command.console || command.result || '').toString();
-        p.resolve({ ok:true, raw });
+        if (p) {
+          pend.delete(command.responseid);
+          clearTimeout(p.timeout);
+          const raw = (command.console || command.result || '').toString();
+          p.resolve({ ok:true, raw });
+        }
       }
-    } catch (e) { dbg("hook_processAgentData err: " + e); }
+    } catch (e) { err(e); }
   };
 
-  // Send runcommands; handle local or peer; wait for reply
-  function runCommandsAndWait(nodeId, type, lines, runAsUser){
+  // peering-safe runcommands with reply:true
+  function runCommandsAndWait(nodeId, type, lines, runAsUser) {
     return new Promise((resolve) => {
       const responseid = makeResponseId();
       const theCommand = {
         action: 'runcommands',
-        type,                                 // 'bat' or 'ps'
+        type,                               // 'bat' or 'ps'
         cmds: Array.isArray(lines) ? lines : [ String(lines||'') ],
-        runAsUser: !!runAsUser,               // false -> run as agent
+        runAsUser: !!runAsUser,             // false: run as agent account
         reply: true,
         responseid
       };
@@ -79,99 +92,132 @@ module.exports.odcmini = function (parent) {
         if (pend.has(responseid)) pend.delete(responseid);
         resolve({ ok:false, raw:'', meta:'timeout' });
       }, 15000);
+
       pend.set(responseid, { resolve, timeout });
 
+      // try local send first
       const agent = (wsserver && wsserver.wsagents && wsserver.wsagents[nodeId]) || null;
       if (agent && agent.authenticated === 2) {
-        try { agent.send(JSON.stringify(theCommand)); } catch (ex) { dbg("send local fail: " + ex); resolve({ ok:false, raw:'', meta:'send_fail' }); }
+        try { agent.send(JSON.stringify(theCommand)); }
+        catch (ex) { err(ex); resolve({ ok:false, raw:'', meta:'send_fail_local' }); }
         return;
       }
 
+      // otherwise try peering dispatch
       const ms = obj.meshServer && obj.meshServer.multiServer;
       if (ms) {
         try { ms.DispatchMessage({ action:'agentCommand', nodeid: nodeId, command: theCommand }); }
-        catch (ex) { dbg("dispatch peer fail: " + ex); resolve({ ok:false, raw:'', meta:'peer_send_fail' }); }
+        catch (ex) { err(ex); resolve({ ok:false, raw:'', meta:'peer_send_fail' }); }
         return;
       }
 
+      // no route to agent
       resolve({ ok:false, raw:'', meta:'no_route' });
     });
   }
 
-  // Fast Windows probe with CMD (no admin needed). Prints:
-  //   svc=Running|NotRunning|Unknown
-  //   p1=True|False
-  //   p2=True|False
+  // ============== Checks ==============
+  // fast CMD netstat for two ports + service query via sc
   async function checkServiceAndPorts(nodeId){
+    // One CMD payload; netstat is fast. sc query can run without admin (read status).
+    // Output lines we parse:
+    //   p1=True
+    //   p2=True
+    //   svc=Running|Stopped|NotFound|Unknown
     const bat = [
-      // service
-      `sc query "${SERVICE_NAME}" | findstr /I RUNNING >nul && echo svc=Running || (sc query "${SERVICE_NAME}" | findstr /I STOPPED >nul && echo svc=NotRunning || echo svc=Unknown)`,
-      // ports
-      `(netstat -an | findstr /C::20707 >nul && echo p1=True || echo p1=False)`,
-      `(netstat -an | findstr /C::20773 >nul && echo p2=True || echo p2=False)`
-    ].join(' & ');
+      `(netstat -an | findstr /C::${PORT1} >nul && echo p1=True || echo p1=False)`,
+      `& (netstat -an | findstr /C::${PORT2} >nul && echo p2=True || echo p2=False)`,
+      `& (sc query "${SERVICE_NAME}" | findstr /I RUNNING >nul && echo svc=Running || (sc query "${SERVICE_NAME}" | findstr /I STOPPED >nul && echo svc=Stopped || echo svc=NotFound))`
+    ].join(' ');
 
     const res = await runCommandsAndWait(nodeId, 'bat', bat, false);
     const raw = (res && res.raw) ? String(res.raw) : '';
 
-    // Parse
-    const ms = /svc\s*=\s*(Running|NotRunning|Unknown)/i.exec(raw);
+    // parse ports
     const m1 = /p1\s*=\s*(true|false)/i.exec(raw);
     const m2 = /p2\s*=\s*(true|false)/i.exec(raw);
-    const svc = ms ? ms[1] : 'Unknown';
-    const p1  = m1 ? parseBool(m1[1]) : false;
-    const p2  = m2 ? parseBool(m2[1]) : false;
+    const p1 = m1 ? parseBool(m1[1]) : false;
+    const p2 = m2 ? parseBool(m2[1]) : false;
 
-    const status = p1 ? 'App Online' : (p2 ? 'Not signed in' : 'Offline');
-    return { ok: !!res && res.ok === true, status, service: svc, port20707: !!p1, port20773: !!p2, raw };
+    // parse service
+    const ms = /svc\s*=\s*([A-Za-z]+)/i.exec(raw);
+    const svc = ms ? ms[1] : 'Unknown';
+
+    // final status
+    const status = p1 ? 'App Online' : (p2 ? 'Not signed in' : (isLocalAgent(nodeId) ? 'Online (agent)' : 'Offline'));
+
+    return { id: nodeId, ok: !!res && !!res.ok, status, service: svc, port20707: !!p1, port20773: !!p2, raw };
   }
 
-  // ---- admin bridge
+  async function echoTest(nodeId){
+    const res = await runCommandsAndWait(nodeId, 'bat', 'echo odc_ok', false);
+    return { id: nodeId, ok: !!(res && res.ok), raw: (res && res.raw) || '', meta: res && res.meta };
+  }
+
+  // ============== Admin bridge ==============
   obj.handleAdminReq = async function(req, res, user) {
     try {
-      if (!user) { res.status(401).end('Unauthorized'); return; }
-
+      // health
       if (req.query.health == 1) {
-        res.json({ ok:true, plugin:"odcmini", exports: obj.exports, hasUser: !!user });
+        res.json({ ok:true, plugin:'odcmini', exports: obj.exports, hasUser: !!user });
         return;
       }
 
-      if (req.query.listonline == 1) {
-        res.json({ ok:true, agents: listOnline() });
+      // who am I
+      if (req.query.whoami == 1) {
+        if (!user) { res.status(401).json({ ok:false, reason:'no user' }); return; }
+        res.json({ ok:true, user: summarizeUser(user) });
         return;
       }
 
+      // list local agents only (peering note)
+      if (req.query.listlocal == 1) {
+        if (!user) { res.status(401).end('Unauthorized'); return; }
+        res.json({ ok:true, agents: listLocalAgents() });
+        return;
+      }
+
+      // where is this node (local? peering available?)
+      if (req.query.where == 1) {
+        if (!user) { res.status(401).end('Unauthorized'); return; }
+        const raw = req.query.id;
+        const id = normalizeId(Array.isArray(raw) ? raw[0] : raw);
+        const local = isLocalAgent(id);
+        const hasPeers = !!(obj.meshServer && obj.meshServer.multiServer);
+        res.json({ ok:true, id, local, hasPeers });
+        return;
+      }
+
+      // simple runcommands echo test with reply:true
+      if (req.query.echotest == 1) {
+        if (!user) { res.status(401).end('Unauthorized'); return; }
+        const raw = req.query.id;
+        const id = normalizeId(Array.isArray(raw) ? raw[0] : raw);
+        const out = await echoTest(id);
+        res.json(out);
+        return;
+      }
+
+      // service + ports check (always try runcommands, peering-safe)
       if (req.query.svc == 1) {
-        let id = req.query.id;
-        if (!id) { res.json({ ok:false, reason:'missing id' }); return; }
-        id = normalizeId(id);
-
-        // Always attempt; runCommands will return meta: 'no_route' if it can't reach the agent
+        if (!user) { res.status(401).end('Unauthorized'); return; }
+        const raw = req.query.id;
+        const id = normalizeId(Array.isArray(raw) ? raw[0] : raw);
         try {
           const out = await checkServiceAndPorts(id);
-          res.json({ id, ...out });
+          res.json(out);
         } catch (e) {
-          res.json({ id, ok:false, status:'Error', port20707:false, port20773:false, service:'Unknown', raw:'' });
-        }
-        return;
-
-        try {
-          const out = await checkServiceAndPorts(id);
-          res.json({ id, ...out });
-        } catch (e) {
-          dbg("svc err: " + e);
-          res.json({ id, ok:false, status:'Error', port20707:false, port20773:false, service:'Unknown', raw:'' });
+          err(e);
+          res.json({ id, ok:false, status:'Error', service:'Unknown', port20707:false, port20773:false, raw:'' });
         }
         return;
       }
 
+      // default
       res.sendStatus(404);
-    } catch (e) {
-      dbg("handleAdminReq err: " + e);
-      res.sendStatus(500);
-    }
+    } catch (e) { err(e); res.sendStatus(500); }
   };
 
-  log("loaded");
+  log("odcmini loaded");
   return obj;
 };
