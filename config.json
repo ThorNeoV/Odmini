@@ -4,11 +4,13 @@
   "version": "0.0.1",
   "author": "you",
   "description": "Tiny plugin with a single health endpoint. No UI injection.",
-  "hasAdminPanel": false,
-  "homepage": "https://example.invalid",
-  "changelogUrl": "https://example.invalid",
-  "configUrl": "https://example.invalid",
-  "downloadUrl": "https://example.invalid",
-  "repository": { "type": "git", "url": "https://example.invalid" },
+  "homepage": "https://github.com/ThorNeoV/Odmini",
+  "changelogUrl": "https://raw.githubusercontent.com/ThorNeoV/Odmini/refs/heads/main/README.md",
+  "configUrl": "https://raw.githubusercontent.com/ThorNeoV/Odmini/refs/heads/main/config.json",
+  "downloadUrl": "https://github.com/ThorNeoV/Odmini/archive/refs/heads/main.zip",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ThorNeoV/Odmini.git"
+  },
   "meshCentralCompat": ">=1.0.0"
 }
