@@ -1,7 +1,7 @@
 {
   "name": "ODC Mini",
-  "shortName": "servicePorts",
-  "version": "0.0.7",
+  "shortName": "odcmini",
+  "version": "0.0.8",
   "author": "you",
   "description": "Tiny plugin with a single health endpoint. No UI injection.",
   "hasAdminPanel": false,
