@@ -1,7 +1,7 @@
 {
   "name": "ODC Mini",
   "shortName": "odcmini",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "author": "you",
   "description": "Tiny plugin with a single health endpoint. No UI injection.",
   "hasAdminPanel": false,
