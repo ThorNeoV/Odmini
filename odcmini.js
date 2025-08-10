@@ -1,261 +1,192 @@
 "use strict";
 
-// This is the main plugin function that MeshCentral expects
-module.exports.odcmini = function (server, config) {
-    const pluginName = "odcmini";
-    const customRecordKey = pluginName + "-ports";
-    
-    console.log(pluginName + " Plugin: Initializing...");
+/**
+ * ODCMini – Minimal, safe admin-bridge plugin (Windows-only probe)
+ *
+ * Endpoints (when logged in):
+ *   /pluginadmin.ashx?pin=odcmini&health=1
+ *   /pluginadmin.ashx?pin=odcmini&listlocal=1                ← show local wsagents keys
+ *   /pluginadmin.ashx?pin=odcmini&find=1&q=<shortOrPartial>  ← fuzzy-find an agent key
+ *   /pluginadmin.ashx?pin=odcmini&svc=1&id=<shortOrLong>     ← run netstat+sc on agent
+ *
+ * No UI injection. No DB writes. No peering logic (local server only).
+ */
 
-    // =========================================
-    // 1. Register plugin admin handler for iframe UI
-    // =========================================
-    server.pluginAdminRegisterHandler(pluginName, (req, res, next) => {
-        const query = req.query || {};
-        const nodeid = query.nodeid;
-        const action = query.action;
-        
-        // Handle health check requests
-        if (action === 'health') {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({ status: "ok" }));
-        }
-        
-        // Handle port status requests
-        if (action === 'status' && nodeid) {
-            server.db.Get(nodeid, customRecordKey, (err, record) => {
-                const response = err || !record ? 
-                    { error: "No status data" } : 
-                    { ports: record.data, timestamp: record.ts };
-                
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify(response));
-            });
-            return;
-        }
-        
-        // Handle port check execution
-        if (action === 'check' && nodeid) {
-            const agent = server.wsagents[nodeid];
-            if (!agent || agent.state !== 1) {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ error: "Agent offline" }));
-            }
-            
-            runPortCheck(nodeid, (result) => {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify(result));
-            });
-            return;
-        }
-        
-        // Default: Serve UI iframe content
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(getUIHTML(pluginName));
+module.exports.odcmini = function (parent) {
+  const obj = {};
+  obj.parent = parent;                 // plugin handler
+  obj.meshServer = parent.parent;      // MeshCentral server
+  const wsserver = obj.meshServer && obj.meshServer.webserver;
+
+  obj.exports = ["handleAdminReq", "hook_processAgentData"];
+
+  const SERVICE_NAME = "OneDriveCheckService";
+  const log = (m)=>{ try{ obj.meshServer.info("odcmini: "+m); }catch{ console.log("odcmini:",m); } };
+  const err = (e)=>{ try{ obj.meshServer.debug("odcmini error: "+(e && e.stack || e)); }catch{ console.error("odcmini error:",e); } };
+
+  // ===== helpers
+
+  function wsAgents() {
+    return (wsserver && wsserver.wsagents) || {};
+  }
+
+  // Try to resolve a provided id (short or long) to an exact wsagents key
+  function resolveNodeId(input) {
+    if (!input) return null;
+    const a = wsAgents();
+    const want = String(input).trim();
+    const long = want.startsWith('node//') ? want : ('node//' + want);
+
+    if (a[long]) return long; // exact match
+
+    // If they passed short id, try exact short id match against keys
+    const short = want.startsWith('node//') ? want.substring(6) : want;
+    const keys = Object.keys(a);
+    // exact short match after 'node//'
+    let hit = keys.find(k => k.substring(6) === short);
+    if (hit) return hit;
+
+    // fallback: contains/startsWith search (best-effort)
+    hit = keys.find(k => k.includes(short));
+    if (hit) return hit;
+
+    return null;
+  }
+
+  // RunCommands reply tracking
+  const pend = new Map();
+  const mkRid = ()=> 'odc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+  obj.hook_processAgentData = function(agent, command) {
+    try {
+      if (!command) return;
+      if (command.action === 'runcommands' && command.responseid) {
+        const w = pend.get(command.responseid);
+        if (!w) return;
+        pend.delete(command.responseid);
+        clearTimeout(w.timeout);
+        const raw = (command.console || command.result || '').toString();
+        w.resolve({ ok:true, raw });
+      }
+    } catch (e) { err(e); }
+  };
+
+  function runBatAndWait(nodeId, batLine){
+    return new Promise((resolve)=>{
+      const agentKey = resolveNodeId(nodeId);
+      if (!agentKey) { resolve({ ok:false, raw:'', meta:'agent_not_found' }); return; }
+      const agent = wsAgents()[agentKey];
+      if (!agent) { resolve({ ok:false, raw:'', meta:'offline' }); return; }
+
+      const responseid = mkRid();
+      const payload = {
+        action: 'runcommands',
+        type: 'bat',
+        cmds: [ String(batLine||'') ],
+        runAsUser: false,
+        reply: true,
+        responseid
+      };
+
+      const timeout = setTimeout(()=>{
+        if (pend.has(responseid)) pend.delete(responseid);
+        resolve({ ok:false, raw:'', meta:'timeout' });
+      }, 20000);
+
+      pend.set(responseid, { resolve, timeout });
+
+      try { agent.send(JSON.stringify(payload)); }
+      catch (ex) { err(ex); resolve({ ok:false, raw:'', meta:'send_fail' }); }
     });
+  }
 
-    // =========================================
-    // 2. Core port check function (using netstat)
-    // =========================================
-    function runPortCheck(nodeid, callback) {
-        const agent = server.wsagents[nodeid];
-        if (!agent || agent.state !== 1) {
-            return callback({ error: "Agent offline" });
+  function buildWinProbe(){
+    return [
+      '(netstat -an | findstr /C::20707 >nul && echo p1=True || echo p1=False)',
+      '& (netstat -an | findstr /C::20773 >nul && echo p2=True || echo p2=False)',
+      '& (sc query "' + SERVICE_NAME + '" | findstr /I RUNNING >nul && echo svc=Running || (sc query "' + SERVICE_NAME + '" | findstr /I STATE >nul && echo svc=NotRunning || echo svc=NotFound))'
+    ].join(' ');
+  }
+
+  function parseProbe(raw){
+    const s = String(raw||'');
+    const m1 = /p1\s*=\s*(true|false)/i.exec(s);
+    const m2 = /p2\s*=\s*(true|false)/i.exec(s);
+    const m3 = /svc\s*=\s*(Running|NotRunning|NotFound)/i.exec(s);
+    const port20707 = m1 ? (/true/i.test(m1[1])) : false;
+    const port20773 = m2 ? (/true/i.test(m2[1])) : false;
+    const service = m3 ? m3[1] : 'Unknown';
+    let status = 'Offline';
+    if (port20707) status = 'App Online';
+    else if (port20773) status = 'Not signed in';
+    else status = 'Offline';
+    return { status, service, port20707, port20773 };
+  }
+
+  // ===== admin bridge
+  obj.handleAdminReq = async function(req, res, user) {
+    try {
+      if (!user) { res.status(401).end('Unauthorized'); return; }
+
+      if (req.query.health == 1) { res.json({ ok:true, plugin:'odcmini', exports:obj.exports }); return; }
+
+      if (req.query.listlocal == 1) {
+        const out = {};
+        const a = wsAgents();
+        Object.keys(a).forEach(k => { out[k] = true; });
+        res.json({ ok:true, agents: out });
+        return;
+      }
+
+      if (req.query.find == 1) {
+        const q = String(req.query.q || '').trim();
+        if (!q) { res.json({ ok:false, reason:'missing q' }); return; }
+        const a = wsAgents();
+        const keys = Object.keys(a);
+        const short = q.startsWith('node//') ? q.substring(6) : q;
+        const hits = keys.filter(k => k.substring(6) === short || k.includes(short));
+        res.json({ ok:true, q, hits });
+        return;
+      }
+
+      if (req.query.svc == 1) {
+        const provided = String(req.query.id || '').trim();
+        if (!provided) { res.json({ ok:false, reason:'missing id' }); return; }
+
+        const resolved = resolveNodeId(provided);
+        if (!resolved) {
+          res.json({ id: provided.startsWith('node//')?provided:('node//'+provided), ok:false, status:'Offline', service:'Unknown', port20707:false, port20773:false, raw:'', meta:'agent_not_found' });
+          return;
         }
-        
-        // Platform-specific commands
-        const commands = {
-            win32: 'netstat -an | find "LISTENING" | findstr /C:":20707" /C:":20773"',
-            linux: 'netstat -tuln | grep -E ":20707|:20773"',
-            darwin: 'netstat -an | grep -E ".20707|.20773" | grep LISTEN'
-        };
-        
-        // Create command object
-        const cmd = {
-            action: "runcommands",
-            cmds: [{
-                cmd: agent.core.platform === 'win32' ? 'cmd.exe' : '/bin/sh',
-                args: [
-                    agent.core.platform === 'win32' ? '/c' : '-c',
-                    commands[agent.core.platform] || commands.linux
-                ]
-            }],
-            responseid: "odcmini-" + Date.now()
-        };
-        
-        // Send command to agent
-        agent.send(JSON.stringify(cmd));
-        
-        // Handle response
-        const responseHandler = (agent, msg) => {
-            if (msg.responseid === cmd.responseid) {
-                server.removeListener('agentmessage', responseHandler);
-                
-                const result = { 20707: false, 20773: false };
-                let output = "";
-                
-                // Collect output from all commands
-                if (msg.cmds && msg.cmds.length > 0 && msg.cmds[0].output) {
-                    output = msg.cmds[0].output;
-                }
-                
-                // Parse output
-                result[20707] = output.includes(':20707');
-                result[20773] = output.includes(':20773');
-                
-                // Save result
-                const record = {
-                    data: result,
-                    ts: Date.now()
-                };
-                
-                server.db.Set(nodeid, customRecordKey, record, (err) => {
-                    if (err) console.error(pluginName + " Plugin: Save error -", err);
-                    callback({ success: true, ports: result });
-                });
-            }
-        };
-        
-        server.on('agentmessage', responseHandler);
-        
-        // Set timeout in case no response
-        setTimeout(() => {
-            server.removeListener('agentmessage', responseHandler);
-            callback({ error: "Timeout waiting for response" });
-        }, 15000);
-    }
 
-    // =========================================
-    // 3. Register UI elements safely
-    // =========================================
-    server.on("webui-startup-end", (req, res) => {
-        // Add custom column
-        res.end(`
-            <script>
-            $(function() {
-                // Add custom column
-                meshserver.addDeviceColumn({
-                    id: "odcminiStatus",
-                    name: "ODC Services",
-                    width: 120,
-                    sortable: true,
-                    value: function(device) {
-                        const record = device.customRecords && device.customRecords['${customRecordKey}'];
-                        if (!record || !record.data) return '<span class="ui grey label">N/A</span>';
-                        
-                        const ports = record.data;
-                        return ports[20707] 
-                            ? '<span style="color:green">✓ 20707</span>' 
-                            : '<span style="color:red">✗ 20707</span>';
-                    }
-                });
-                
-                // Add custom tab
-                meshserver.addDeviceTab('odcminiTab', 'ODC Services', function(device) {
-                    return '/pluginadmin.ashx?pin=${pluginName}&nodeid=' + device._id;
-                });
-            });
-            </script>
-        `);
-    });
-
-    // =========================================
-    // 4. UI HTML Template
-    // =========================================
-    function getUIHTML(pluginName) {
-        return `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>ODC Services</title>
-    <link rel="stylesheet" href="/public/semantic/semantic.min.css">
-    <style>
-        body { padding: 20px; background: #f8f8f8; }
-        .ui.table { margin-top: 15px; }
-        .refresh-btn { margin-top: 15px; }
-        .status-badge { display: inline-block; width: 20px; text-align: center; }
-    </style>
-</head>
-<body>
-    <h2><i class="plug icon"></i> ODC Service Status</h2>
-    <div id="status-container">Loading service status...</div>
-    <button class="ui blue button refresh-btn" onclick="runCheck()">
-        <i class="sync icon"></i> Refresh Status
-    </button>
-    
-    <script src="/public/jquery-3.4.1.min.js"></script>
-    <script>
-        const nodeid = new URLSearchParams(window.location.search).get('nodeid');
-        
-        function loadStatus() {
-            $.get('/pluginadmin.ashx?pin=${pluginName}&action=status&nodeid=' + nodeid)
-                .done(data => {
-                    if (data.error) {
-                        $('#status-container').html('<div class="ui red message">' + data.error + '</div>');
-                        return;
-                    }
-                    
-                    const ports = data.ports;
-                    const timestamp = new Date(data.timestamp).toLocaleString();
-                    
-                    let html = '<div class="ui two statistics">';
-                    html += '<div class="statistic">';
-                    html += '  <div class="value">';
-                    html += ports[20707] ? '<span class="status-badge" style="color:green">✓</span>' : '<span class="status-badge" style="color:red">✗</span>';
-                    html += '  </div>';
-                    html += '  <div class="label">Port 20707<br>Main Service</div>';
-                    html += '</div>';
-                    html += '<div class="statistic">';
-                    html += '  <div class="value">';
-                    html += ports[20773] ? '<span class="status-badge" style="color:green">✓</span>' : '<span class="status-badge" style="color:red">✗</span>';
-                    html += '  </div>';
-                    html += '  <div class="label">Port 20773<br>Helper Service</div>';
-                    html += '</div>';
-                    html += '</div>';
-                    html += '<p class="ui small text"><i class="clock icon"></i> Last checked: ' + timestamp + '</p>';
-                    
-                    $('#status-container').html(html);
-                })
-                .fail(() => {
-                    $('#status-container').html('<div class="ui red message">Failed to load status</div>');
-                });
+        const bat = buildWinProbe();
+        const r = await runBatAndWait(resolved, bat);
+        if (!r.ok) {
+          res.json({ id: resolved, ok:false, status:'Offline', service:'Unknown', port20707:false, port20773:false, raw:r.raw||'', meta:r.meta });
+          return;
         }
-        
-        function runCheck() {
-            $('.refresh-btn').addClass('loading');
-            $.get('/pluginadmin.ashx?pin=${pluginName}&action=check&nodeid=' + nodeid)
-                .done(data => {
-                    if (data.error) {
-                        alert('Error: ' + data.error);
-                    } else {
-                        loadStatus();
-                    }
-                })
-                .fail(() => alert('Refresh failed'))
-                .always(() => $('.refresh-btn').removeClass('loading'));
-        }
-        
-        $(document).ready(() => {
-            loadStatus();
-        });
-    </script>
-</body>
-</html>
-        `;
-    }
+        const parsed = parseProbe(r.raw);
+        res.json({ id: resolved, ok:true, raw:r.raw, ...parsed });
+        return;
+      }
 
-    // =========================================
-    // 5. Perform initial checks
-    // =========================================
-    setTimeout(() => {
-        console.log(pluginName + " Plugin: Performing initial port checks");
-        Object.keys(server.wsagents).forEach(nodeid => {
-            const agent = server.wsagents[nodeid];
-            if (agent && agent.state === 1) {
-                runPortCheck(nodeid, () => {});
-            }
-        });
-    }, 10000);
-    
-    console.log(pluginName + " Plugin: Loaded successfully");
+      if (req.query.admin == 1) {
+        res.setHeader('Content-Type','text/html; charset=utf-8');
+        res.end(`<!doctype html><meta charset="utf-8"><title>ODCMini</title>
+          <h3>ODCMini</h3>
+          <ul>
+            <li><code>?pin=odcmini&health=1</code></li>
+            <li><code>?pin=odcmini&listlocal=1</code></li>
+            <li><code>?pin=odcmini&find=1&q=&lt;shortOrPartial&gt;</code></li>
+            <li><code>?pin=odcmini&svc=1&id=&lt;shortOrLong&gt;</code></li>
+          </ul>`);
+        return;
+      }
+
+      res.sendStatus(404);
+    } catch (e) { err(e); res.sendStatus(500); }
+  };
+
+  log('loaded');
+  return obj;
 };
