@@ -1,211 +1,166 @@
 "use strict";
 
-/**
- * odcmini – minimal, admin-bridge only plugin
- * - No UI injection, no Express, no DB writes.
- * - Uses RunCommands with reply:true and hook_processAgentData to collect output.
- *
- * Endpoints (logged-in):
- *   /pluginadmin.ashx?pin=odcmini&health=1
- *   /pluginadmin.ashx?pin=odcmini&whoami=1
- *   /pluginadmin.ashx?pin=odcmini&listlocal=1     (alias of listonline)
- *   /pluginadmin.ashx?pin=odcmini&listonline=1    (agents on THIS server only)
- *   /pluginadmin.ashx?pin=odcmini&where=1&id=<id> (is agent local? peering available?)
- *   /pluginadmin.ashx?pin=odcmini&echotest=1&id=<id>
- *   /pluginadmin.ashx?pin=odcmini&svc=1&id=<id>   (service+ports via fast CMD)
- */
+module.exports = {
+    init: function (parent) {
+        const server = parent;
+        const module = this;
+        
+        // =========================================
+        // 1. Add custom column to devices grid
+        // =========================================
+        server.addDeviceColumn({
+            id: "servicePortsStatus",
+            name: "Service Ports",
+            width: 120,
+            sortable: true,
+            value: (device) => {
+                if (!device.custom || !device.custom.servicePorts) return "❓ Not checked";
+                
+                const status = device.custom.servicePorts;
+                const port20707 = status[20707] ? "🟢" : "🔴";
+                const port20773 = status[20773] ? "🟢" : "🔴";
+                
+                return `${port20707} 20707 | ${port20773} 20773`;
+            }
+        });
 
-module.exports.odcmini = function (parent) {
-  const obj = {};
-  obj.parent = parent;                 // plugin handler
-  obj.meshServer = parent.parent;      // MeshCentral server
-  const wsserver = obj.meshServer && obj.meshServer.webserver;
+        // =========================================
+        // 2. Add custom tab to device view
+        // =========================================
+        server.addDeviceTab({
+            id: "servicePortsTab",
+            name: "Service Ports",
+            get: (device, cb) => {
+                let content = `<div class="servicePortsContainer" style="padding:20px">`;
+                
+                if (device.custom && device.custom.servicePorts) {
+                    const status = device.custom.servicePorts;
+                    content += `
+                        <h3>Port Status</h3>
+                        <table class="ui table">
+                            <tr><td>Port 20707:</td><td>${status[20707] ? '<span class="ui green label">Open</span>' : '<span class="ui red label">Closed</span>'}</td></tr>
+                            <tr><td>Port 20773:</td><td>${status[20773] ? '<span class="ui green label">Open</span>' : '<span class="ui red label">Closed</span>'}</td></tr>
+                        </table>
+                        <button class="ui button" onclick="refreshPortStatus('${device.agentid}')">Re-check Ports</button>
+                    `;
+                } else {
+                    content += `<p>No port status data available. <button class="ui button" onclick="refreshPortStatus('${device.agentid}')">Check Ports</button></p>`;
+                }
+                
+                content += `</div>
+                <script>
+                    function refreshPortStatus(agentid) {
+                        meshserver.send({ action: 'refreshPortStatus', agentid: agentid });
+                    }
+                </script>`;
+                
+                cb(content);
+            }
+        });
 
-  obj.exports = ["handleAdminReq", "hook_processAgentData"];
+        // =========================================
+        // 3. Handle port check requests
+        // =========================================
+        server.on("connection", (socket) => {
+            socket.on("refreshPortStatus", (data) => {
+                const device = server.getDevice(data.agentid);
+                if (device && device.conn === 1) { // Device is online
+                    module.checkPorts(device);
+                }
+            });
+        });
 
-  // Config
-  const SERVICE_NAME = "OneDriveCheckService";
-  const PORT1 = 20707;
-  const PORT2 = 20773;
+        // =========================================
+        // 4. Core function to check ports
+        // =========================================
+        this.checkPorts = function(device) {
+            // Send command to check ports
+            server.sendAgentAction(device.agentid, {
+                action: "runcommand",
+                run: {
+                    command: "node",
+                    args: ["-e", getPortCheckScript()],
+                    wait: true,
+                    output: true
+                }
+            }, (response) => {
+                if (response.error) {
+                    console.error("Port check error:", response.error);
+                    return;
+                }
 
-  // Logging
-  const log = (m)=>{ try{ obj.meshServer.info("odcmini: " + m); }catch{ console.log("odcmini:", m); } };
-  const err = (e)=>{ try{ obj.meshServer.debug("odcmini error: " + (e && e.stack || e)); }catch{ console.error("odcmini error:", e); } };
-
-  // Helpers
-  const summarizeUser = (u)=> u ? ({ name:u.name, userid:u.userid, domain:u.domain, siteadmin:u.siteadmin }) : null;
-  const parseBool   = (v)=> /^true$/i.test(String(v).trim());
-  const normalizeId = (id)=> (!id ? id : (/^node\/\/.+/i.test(id) ? id : ('node//' + id)));
-  const isLocalAgent = (nodeId)=> !!(wsserver && wsserver.wsagents && wsserver.wsagents[nodeId]);
-
-  function listLocalAgents(){
-    const a = (wsserver && wsserver.wsagents) || {};
-    const out = {};
-    for (const key of Object.keys(a)) {
-      try {
-        const n = a[key].dbNode || a[key].dbNodeKey || null;
-        out[key] = {
-          key,
-          name: (n && (n.name || n.computername)) || null,
-          os:   (n && (n.osdesc || n.agentcaps)) || null
+                try {
+                    const result = JSON.parse(response.output);
+                    device.custom = device.custom || {};
+                    device.custom.servicePorts = result;
+                    
+                    // Save to database
+                    server.setCustomDeviceRecord(device.agentid, "servicePorts", result, (err) => {
+                        if (err) console.error("Failed to save port status:", err);
+                    });
+                    
+                    // Refresh UI
+                    server.refreshDevice(device.agentid);
+                } catch (e) {
+                    console.error("Failed to parse port check results:", e);
+                }
+            });
         };
-      } catch { out[key] = { key }; }
+
+        // =========================================
+        // 5. Port check script (runs on agent)
+        // =========================================
+        function getPortCheckScript() {
+            return `
+                const net = require('net');
+                const ports = [20707, 20773];
+                const results = {};
+                
+                const checkPort = (port) => new Promise(resolve => {
+                    const socket = new net.Socket();
+                    socket.setTimeout(2000);
+                    
+                    socket.on('connect', () => {
+                        socket.destroy();
+                        resolve(true);
+                    });
+                    
+                    socket.on('timeout', () => {
+                        socket.destroy();
+                        resolve(false);
+                    });
+                    
+                    socket.on('error', () => resolve(false));
+                    
+                    socket.connect(port, '127.0.0.1');
+                });
+                
+                (async () => {
+                    for (const port of ports) {
+                        results[port] = await checkPort(port);
+                    }
+                    console.log(JSON.stringify(results));
+                })();
+            `;
+        }
+
+        // =========================================
+        // 6. Check ports when device connects
+        // =========================================
+        server.on("device-connect", (agentid) => {
+            const device = server.getDevice(agentid);
+            if (device) module.checkPorts(device);
+        });
+
+        // =========================================
+        // 7. Check ports on existing devices
+        // =========================================
+        setTimeout(() => {
+            server.getDevices().forEach(device => {
+                if (device.conn === 1) module.checkPorts(device);
+            });
+        }, 10000);
+        
+        console.log("Service Ports Plugin loaded");
     }
-    return out;
-  }
-
-  // ===== Reply handling for RunCommands =====
-  const pend = new Map(); // responseid -> { resolve, timeout }
-  const makeResponseId = ()=> 'odc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-
-  obj.hook_processAgentData = function(agent, command) {
-    try {
-      if (!command) return;
-      if (command.action === 'runcommands' && command.responseid) {
-        const p = pend.get(command.responseid);
-        if (p) {
-          pend.delete(command.responseid);
-          clearTimeout(p.timeout);
-          const raw = (command.console || command.result || '').toString();
-          p.resolve({ ok:true, raw });
-        }
-      }
-    } catch (e) { err(e); }
-  };
-
-  // Peering-safe RunCommands with reply:true
-  function runCommandsAndWait(nodeId, type, lines, runAsUser) {
-    return new Promise((resolve) => {
-      const responseid = makeResponseId();
-      const theCommand = {
-        action: 'runcommands',
-        type, // 'bat' or 'ps'
-        cmds: Array.isArray(lines) ? lines : [ String(lines||'') ],
-        runAsUser: !!runAsUser, // false: agent account
-        reply: true,
-        responseid
-      };
-
-      const timeout = setTimeout(() => {
-        if (pend.has(responseid)) pend.delete(responseid);
-        resolve({ ok:false, raw:'', meta:'timeout' });
-      }, 15000);
-
-      pend.set(responseid, { resolve, timeout });
-
-      // Try local first
-      const agent = (wsserver && wsserver.wsagents && wsserver.wsagents[nodeId]) || null;
-      if (agent && agent.authenticated === 2) {
-        try { agent.send(JSON.stringify(theCommand)); }
-        catch (ex) { err(ex); resolve({ ok:false, raw:'', meta:'send_fail_local' }); }
-        return;
-      }
-
-      // Then peering
-      const ms = obj.meshServer && obj.meshServer.multiServer;
-      if (ms) {
-        try { ms.DispatchMessage({ action:'agentCommand', nodeid: nodeId, command: theCommand }); }
-        catch (ex) { err(ex); resolve({ ok:false, raw:'', meta:'peer_send_fail' }); }
-        return;
-      }
-
-      // No route
-      resolve({ ok:false, raw:'', meta:'no_route' });
-    });
-  }
-
-  // Fast service + ports check
-  async function checkServiceAndPorts(nodeId){
-    const bat = [
-      `(netstat -an | findstr /C::${PORT1} >nul && echo p1=True || echo p1=False)`,
-      `& (netstat -an | findstr /C::${PORT2} >nul && echo p2=True || echo p2=False)`,
-      `& (sc query "${SERVICE_NAME}" | findstr /I RUNNING >nul && echo svc=Running || (sc query "${SERVICE_NAME}" | findstr /I STOPPED >nul && echo svc=Stopped || echo svc=NotFound))`
-    ].join(' ');
-
-    const res = await runCommandsAndWait(nodeId, 'bat', bat, false);
-    const raw = (res && res.raw) ? String(res.raw) : '';
-
-    const m1 = /p1\s*=\s*(true|false)/i.exec(raw);
-    const m2 = /p2\s*=\s*(true|false)/i.exec(raw);
-    const p1 = m1 ? parseBool(m1[1]) : false;
-    const p2 = m2 ? parseBool(m2[1]) : false;
-
-    const ms = /svc\s*=\s*([A-Za-z]+)/i.exec(raw);
-    const svc = ms ? ms[1] : 'Unknown';
-
-    const status = p1 ? 'App Online' : (p2 ? 'Not signed in' : (isLocalAgent(nodeId) ? 'Online (agent)' : 'Offline'));
-
-    return { id: nodeId, ok: !!(res && res.ok), status, service: svc, port20707: !!p1, port20773: !!p2, raw };
-  }
-
-  async function echoTest(nodeId){
-    const res = await runCommandsAndWait(nodeId, 'bat', 'echo odc_ok', false);
-    return { id: nodeId, ok: !!(res && res.ok), raw: (res && res.raw) || '', meta: res && res.meta };
-  }
-
-  // ===== Admin bridge =====
-  obj.handleAdminReq = async function(req, res, user) {
-    try {
-      // health
-      if (req.query.health == 1) {
-        res.json({ ok:true, plugin:'odcmini', exports: obj.exports, hasUser: !!user });
-        return;
-      }
-
-      // who am I
-      if (req.query.whoami == 1) {
-        if (!user) { res.status(401).json({ ok:false, reason:'no user' }); return; }
-        res.json({ ok:true, user: summarizeUser(user) });
-        return;
-      }
-
-      // listlocal and listonline (alias)
-      if (req.query.listlocal == 1 || req.query.listonline == 1) {
-        if (!user) { res.status(401).end('Unauthorized'); return; }
-        res.json({ ok:true, agents: listLocalAgents() });
-        return;
-      }
-
-      // where is this node
-      if (req.query.where == 1) {
-        if (!user) { res.status(401).end('Unauthorized'); return; }
-        const raw = req.query.id;
-        const id = normalizeId(Array.isArray(raw) ? raw[0] : raw);
-        const local = isLocalAgent(id);
-        const hasPeers = !!(obj.meshServer && obj.meshServer.multiServer);
-        res.json({ ok:true, id, local, hasPeers });
-        return;
-      }
-
-      // simple echo test
-      if (req.query.echotest == 1) {
-        if (!user) { res.status(401).end('Unauthorized'); return; }
-        const raw = req.query.id;
-        const id = normalizeId(Array.isArray(raw) ? raw[0] : raw);
-        const out = await echoTest(id);
-        res.json(out);
-        return;
-      }
-
-      // service + ports
-      if (req.query.svc == 1) {
-        if (!user) { res.status(401).end('Unauthorized'); return; }
-        const raw = req.query.id;
-        const id = normalizeId(Array.isArray(raw) ? raw[0] : raw);
-        try {
-          const out = await checkServiceAndPorts(id);
-          res.json(out);
-        } catch (e) {
-          err(e);
-          res.json({ id, ok:false, status:'Error', service:'Unknown', port20707:false, port20773:false, raw:'' });
-        }
-        return;
-      }
-
-      res.sendStatus(404);
-    } catch (e) { err(e); res.sendStatus(500); }
-  };
-
-  log("odcmini loaded");
-  return obj;
 };
