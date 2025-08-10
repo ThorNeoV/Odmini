@@ -146,10 +146,14 @@ module.exports.odcmini = function (parent) {
         if (!id) { res.json({ ok:false, reason:'missing id' }); return; }
         id = normalizeId(id);
 
-        if (!isAgentOnline(id) && !(obj.meshServer && obj.meshServer.multiServer)) {
-          res.json({ id, ok:false, status:'Offline', port20707:false, port20773:false, service:'Unknown', raw:'' });
-          return;
+        // Always attempt; runCommands will return meta: 'no_route' if it can't reach the agent
+        try {
+          const out = await checkServiceAndPorts(id);
+          res.json({ id, ...out });
+        } catch (e) {
+          res.json({ id, ok:false, status:'Error', port20707:false, port20773:false, service:'Unknown', raw:'' });
         }
+        return;
 
         try {
           const out = await checkServiceAndPorts(id);
